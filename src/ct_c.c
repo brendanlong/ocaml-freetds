@@ -644,8 +644,8 @@ CAMLprim value mltds_buffer_contents( value buffer )
         case CS_FLOAT_TYPE:
         case CS_REAL_TYPE:
             str = alloc_string(buf->copied);
-            strncpy(String_val(str), (char*)(buf->data), buf->copied);
-            
+            memcpy(String_val(str), (char*)(buf->data), buf->copied);
+
             result = alloc(2, 0);
             Store_field(result, 0, hash_variant("Decimal"));
             Store_field(result, 1, str);
@@ -656,8 +656,8 @@ CAMLprim value mltds_buffer_contents( value buffer )
         case CS_VARCHAR_TYPE:
         default:
             str = alloc_string(buf->copied);
-            strncpy(String_val(str), (char*)(buf->data), buf->copied);
-            
+            memcpy(String_val(str), (char*)(buf->data), buf->copied);
+
             result = alloc(2, 0);
             Store_field(result, 0, hash_variant("String"));
             Store_field(result, 1, str);
@@ -677,8 +677,8 @@ CAMLprim value mltds_buffer_contents( value buffer )
     case CS_DECIMAL_TYPE:
     default:
         str = alloc_string(buf->copied);
-        strncpy(String_val(str), (char*)(buf->data), buf->copied);
-        
+        memcpy(String_val(str), (char*)(buf->data), buf->copied);
+
         result = alloc(2, 0);
         Store_field(result, 0, hash_variant("Binary"));
         Store_field(result, 1, str);
@@ -746,8 +746,8 @@ static value get_client_message(CS_CONNECTION* conn, CS_INT msgno)
 
     /*str = caml_copy_string(msgtext);*/
     str = alloc_string(msg.msgstringlen);
-    strncpy(String_val(str), msg.msgstring, msg.msgstringlen ); 
-    
+    memcpy(String_val(str), msg.msgstring, msg.msgstringlen);
+
     result = alloc(2, 0);
     Store_field(result, 0, value_of_severity(msg.severity));
     Store_field(result, 1, str); 
@@ -765,9 +765,9 @@ static value get_server_message(CS_CONNECTION* conn, CS_INT msgno)
       "ct_diag", ct_diag(conn, CS_GET, CS_SERVERMSG_TYPE, msgno, &msg) );
 
     /*str = caml_copy_string(msgtext);*/
-    str = alloc_string(strnlen(msg.text, CS_MAX_MSG) + 1);
-    strncpy(String_val(str), msg.text, strnlen(msg.text, CS_MAX_MSG));
-    
+    str = alloc_string(strnlen(msg.text, msg.textlen));
+    memcpy(String_val(str), msg.text, msg.textlen);
+
     result = alloc(2, 0);
     Store_field(result, 0, value_of_severity(msg.severity));
     Store_field(result, 1, str);
