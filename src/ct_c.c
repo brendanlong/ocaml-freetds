@@ -31,6 +31,7 @@
 #include <caml/memory.h>
 #include <caml/fail.h>
 #include <caml/custom.h>
+#include <caml/threads.h>
 
 void mltds_ct_ctx_finalize(value ctx);
 void mltds_ct_con_finalize(value conn);
@@ -481,7 +482,11 @@ CAMLprim value mltds_ct_command(value cmd, value cmdtype, value option, value te
 CAMLprim value mltds_ct_send(value cmd)
 {
     CAMLparam1(cmd);
-    retval_inspect( "ct_send", ct_send(command_ptr(cmd)));
+    CS_COMMAND* command = command_ptr(cmd);
+    caml_release_runtime_system();
+    CS_RETCODE retval = ct_send(command);
+    caml_acquire_runtime_system();
+    retval_inspect("ct_send", retval);
     CAMLreturn( Val_unit );
 }
 
@@ -489,8 +494,12 @@ CAMLprim value mltds_ct_results(value cmd)
 {
     CAMLparam1(cmd);
     CS_INT restype;
-    
-    retval_inspect( "ct_results", ct_results(command_ptr(cmd), &restype) );
+    CS_COMMAND *command = command_ptr(cmd);
+
+    caml_release_runtime_system();
+    CS_RETCODE retval = ct_results(command, &restype);
+    caml_acquire_runtime_system();
+    retval_inspect("ct_results", retval);
 
     CAMLreturn(value_of_restype(restype));
 }
