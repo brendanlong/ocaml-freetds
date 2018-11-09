@@ -814,6 +814,30 @@ CAMLexport value mltds_add_messages_server(value vconnection, value vlist)
   CAMLreturn(vlist);
 }
 
+CAMLexport value mltds_clear_client_messages(value vconnection)
+{
+  CAMLparam1(vconnection);
+  CS_CONNECTION* conn = connection_ptr(vconnection);
+
+  retval_inspect(
+    "ct_diag",
+    ct_diag(conn, CS_CLEAR, CS_CLIENTMSG_TYPE, CS_UNUSED, NULL) );
+
+    CAMLreturn(Val_unit);
+}
+
+CAMLexport value mltds_clear_server_messages(value vconnection)
+{
+  CAMLparam1(vconnection);
+  CS_CONNECTION* conn = connection_ptr(vconnection);
+
+  retval_inspect(
+    "ct_diag",
+    ct_diag(conn, CS_CLEAR, CS_SERVERMSG_TYPE, CS_UNUSED, NULL) );
+
+    CAMLreturn(Val_unit);
+}
+
 /*** Deallocation ***/
 
 /* FIXME: the programmer should not have to take care about memory. */

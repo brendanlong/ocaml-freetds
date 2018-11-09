@@ -181,4 +181,13 @@ let get_messages ?(client=false) ?(server=false) conn =
   let l = if client then add_messages_client conn [] else [] in
   if server then add_messages_server conn l else l
 
+external clear_messages_client : connection -> unit = "mltds_clear_client_messages"
+
+external clear_messages_server : connection -> unit = "mltds_clear_server_messages"
+
+let clear_messages ?(client=false) ?(server=false) conn =
+  if client then
+    clear_messages_client conn;
+  if server then
+    clear_messages_server conn
 ;;

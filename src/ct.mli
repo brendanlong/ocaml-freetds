@@ -152,3 +152,5 @@ type severity =
 
 val get_messages :
   ?client: bool -> ?server: bool -> connection -> (severity * string) list
+
+val clear_messages : ?client: bool -> ?server: bool -> connection -> unit
