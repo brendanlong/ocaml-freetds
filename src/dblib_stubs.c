@@ -37,6 +37,62 @@
 #define SEVERITY_FATAL Val_int(9)
 #define SEVERITY_CONSISTENCY Val_int(10)
 
+typedef struct User_data {
+  value latest_exception;
+  int have_exception;
+} User_data;
+
+static void userdata_free(DBPROCESS* proc)
+{
+  User_data* data = (User_data*)dbgetuserdata(proc);
+  if (data == NULL)
+    return;
+
+  if (data->have_exception)
+    caml_remove_global_root(&(data->latest_exception));
+
+  dbsetuserdata(proc, NULL);
+  caml_stat_free(data);
+}
+
+static void userdata_setup(DBPROCESS* proc)
+{
+  userdata_free(proc);
+
+  User_data* data = caml_stat_alloc(sizeof(User_data));
+  data->have_exception = FALSE;
+  dbsetuserdata(proc, (BYTE*)data);
+}
+
+static void userdata_set_latest_exception(DBPROCESS *proc, value exn)
+{
+  User_data* data = (User_data*)dbgetuserdata(proc);
+  if(data == NULL)
+    return;
+
+  if(data->have_exception)
+    caml_remove_global_root(&(data->latest_exception));
+
+  caml_register_global_root(&exn);
+  data->latest_exception = exn;
+  data->have_exception = TRUE;
+}
+
+static void maybe_raise_userdata_exn(DBPROCESS* proc)
+{
+  CAMLparam0();
+  CAMLlocal1(vexn);
+
+  User_data* data = (User_data*)dbgetuserdata(proc);
+  if(data == NULL || !data->have_exception)
+    CAMLreturn0;
+
+  vexn = data->latest_exception;
+  data->have_exception = FALSE;
+  caml_remove_global_root(&(data->latest_exception));
+  caml_raise(vexn);
+}
+
 static void raise_error(value, char*) __attribute__ ((noreturn));
 
 static void raise_error(value severity, char *msg)
@@ -68,13 +124,13 @@ static int convert_severity(int severity)
 static int msg_handler(DBPROCESS *dbproc, DBINT msgno, int msgstate, int severity,
 		       char *msgtext, char *srvname, char *procname, int line)
 {
-  enum {changed_database = 5701, changed_language = 5703 };
+  enum { changed_database = 5701, changed_language = 5703 };
 
   if (msgno == changed_database || msgno == changed_language)
     return 0;
 
   CAMLparam0();
-  CAMLlocal3(vseverity, vline, vmsg);
+  CAMLlocal4(vseverity, vline, vmsg, vres);
   static value *handler = NULL;
 
   if (handler == NULL) {
@@ -87,7 +143,14 @@ static int msg_handler(DBPROCESS *dbproc, DBINT msgno, int msgstate, int severit
   vline = Val_int(line);
   vmsg = caml_copy_string(msgtext);
 
-  caml_callback3(*handler, vseverity, vline, vmsg);
+  vres = caml_callback3_exn(*handler, vseverity, vline, vmsg);
+  if (Is_exception_result(vres))
+  {
+    if (dbproc == NULL)
+      caml_raise(Extract_exception(vres));
+    else
+      userdata_set_latest_exception(dbproc, Extract_exception(vres));
+  }
 
   CAMLreturn(INT_CANCEL); /* should not return */
 }
@@ -99,7 +162,7 @@ static int err_handler(DBPROCESS *dbproc, int severity, /* in syberror.h */
                        char *dberrstr, char *oserrstr)
 {
   CAMLparam0();
-  CAMLlocal1(vmsg);
+  CAMLlocal2(vmsg, vres);
   CAMLlocalN(args, 2);
   static value *handler = NULL;
   static value *exn = NULL;
@@ -132,9 +195,14 @@ static int err_handler(DBPROCESS *dbproc, int severity, /* in syberror.h */
     handler = caml_named_value("Freetds.Dblib.err_handler");
   }
   vmsg = caml_copy_string(dberrstr);
-  caml_callback3(*handler, args[0] /* severity */, Val_int(dberr), vmsg);
-  /* FIXME: allow the handler to return whether to continue trying on
-     timeouts?  Separate handler for timeouts?? */
+  vres = caml_callback3_exn(*handler, args[0] /* severity */, Val_int(dberr), vmsg);
+  if (Is_exception_result(vres))
+  {
+    if (dbproc == NULL)
+      caml_raise(Extract_exception(vres));
+    else
+      userdata_set_latest_exception(dbproc, Extract_exception(vres));
+  }
 
   CAMLreturn(INT_CANCEL); /* should not return */
 }
@@ -251,6 +319,7 @@ value ocaml_freetds_dbopen(value vuser, value vpasswd, value vchar_set,
     raise_error(SEVERITY_FATAL,
                 "Freetds.Dblib.connect: unable to connect to the database");
   }
+  userdata_setup(dbproc);
   vdbproc = DBPROCESS_ALLOC();
   DBPROCESS_VAL(vdbproc) = dbproc;
   CAMLreturn(vdbproc);
@@ -266,14 +335,20 @@ CAMLexport value ocaml_freetds_dbopen_bc(value * argv, int argn)
 CAMLexport value ocaml_freetds_dbclose(value vdbproc)
 {
   CAMLparam1(vdbproc);
-  dbclose(DBPROCESS_VAL(vdbproc));
+  DBPROCESS *dbproc = DBPROCESS_VAL(vdbproc);
+  userdata_free(dbproc);
+  dbclose(dbproc);
   CAMLreturn(Val_unit);
 }
 
 CAMLexport value ocaml_freetds_dbuse(value vdbproc, value vdbname)
 {
   CAMLparam2(vdbproc, vdbname);
-  if (dbuse(DBPROCESS_VAL(vdbproc), String_val(vdbname)) == FAIL) {
+  DBPROCESS *dbproc = DBPROCESS_VAL(vdbproc);
+
+  RETCODE ret = dbuse(dbproc, String_val(vdbname));
+  maybe_raise_userdata_exn(dbproc);
+  if (ret == FAIL) {
     caml_raise_not_found(); /* More precise error on the OCaml side. */
   }
   CAMLreturn(Val_unit);
@@ -283,14 +358,13 @@ CAMLexport value ocaml_freetds_dbname(value vdbproc)
 {
   CAMLparam1(vdbproc);
   CAMLlocal1(vname);
-  char *name;
+  DBPROCESS *dbproc = DBPROCESS_VAL(vdbproc);
 
-  name = dbname(DBPROCESS_VAL(vdbproc));
+  char* name = dbname(dbproc);
+  maybe_raise_userdata_exn(dbproc);
   vname = caml_copy_string(name);
-  /* free(name); */ /* generate a segfault */
   CAMLreturn(vname);
 }
-
 
 /* Executing SQL queries
 **********************************************************************/
@@ -298,13 +372,21 @@ CAMLexport value ocaml_freetds_dbname(value vdbproc)
 CAMLexport value ocaml_freetds_dbsqlexec(value vdbproc, value vsql)
 {
   CAMLparam2(vdbproc, vsql);
+  DBPROCESS *dbproc = DBPROCESS_VAL(vdbproc);
 
-  if (dbcmd(DBPROCESS_VAL(vdbproc), String_val(vsql)) == FAIL) {
+  RETCODE ret = dbcmd(dbproc, String_val(vsql));
+  maybe_raise_userdata_exn(dbproc);
+  if (ret == FAIL)
+  {
     raise_error(SEVERITY_RESOURCE, "Freetds.Dblib.sqlexec: cannot "
                 "allocate memory to hold the SQL query");
   }
+
   /* Sending the query to the server resets the command buffer. */
-  if (dbsqlexec(DBPROCESS_VAL(vdbproc)) == FAIL) {
+  ret = dbsqlexec(dbproc);
+  maybe_raise_userdata_exn(dbproc);
+  if (ret == FAIL)
+  {
     caml_raise_not_found(); /* More precise error on the OCaml side. */
   }
   CAMLreturn(Val_unit);
@@ -313,8 +395,11 @@ CAMLexport value ocaml_freetds_dbsqlexec(value vdbproc, value vsql)
 CAMLexport value ocaml_freetds_dbresults(value vdbproc)
 {
   CAMLparam1(vdbproc);
-  RETCODE erc;
-  if ((erc = dbresults(DBPROCESS_VAL(vdbproc))) == FAIL) {
+  DBPROCESS *dbproc = DBPROCESS_VAL(vdbproc);
+  RETCODE erc = dbresults(dbproc);
+  maybe_raise_userdata_exn(dbproc);
+  if (erc == FAIL)
+  {
     raise_error(SEVERITY_PROGRAM,
                 "Freetds.Dblib.results: query was not processed "
                 "successfully by the server");
@@ -326,30 +411,39 @@ CAMLexport value ocaml_freetds_numcols(value vdbproc)
 {
   /* noalloc */
   CAMLparam1(vdbproc);
-  CAMLreturn(Val_int(dbnumcols(DBPROCESS_VAL(vdbproc))));
+  DBPROCESS* dbproc = DBPROCESS_VAL(vdbproc);
+  int num_cols = dbnumcols(dbproc);
+  maybe_raise_userdata_exn(dbproc);
+  CAMLreturn(Val_int(num_cols));
 }
 
 CAMLexport value ocaml_freetds_dbcolname(value vdbproc, value vc)
 {
   CAMLparam2(vdbproc, vc);
   CAMLlocal1(vname);
-  char *name;
-  name = dbcolname(DBPROCESS_VAL(vdbproc), Int_val(vc));
+  DBPROCESS* dbproc = DBPROCESS_VAL(vdbproc);
+
+  char *name = dbcolname(dbproc, Int_val(vc));
+  maybe_raise_userdata_exn(dbproc);
   if (name == NULL)
     /* Raise an exception compatible with [coltype]. */
     raise_error(SEVERITY_PROGRAM,
                 "FreeTDS.Dblib.colname: Column number out of range");
+
   vname = caml_copy_string(name);
-  /* free(name); */ /* Doing it says "invalid pointer". */
   CAMLreturn(vname);
 }
 
 CAMLexport value ocaml_freetds_dbcoltype(value vdbproc, value vc)
 {
   CAMLparam2(vdbproc, vc);
-  int ty;
+  DBPROCESS* dbproc = DBPROCESS_VAL(vdbproc);
+
+  int ty = dbcoltype(dbproc, Int_val(vc));
+  maybe_raise_userdata_exn(dbproc);
+
   /* Keep in sync with "type col_type" on the Caml side. */
-  switch (ty = dbcoltype(DBPROCESS_VAL(vdbproc), Int_val(vc))) {
+  switch (ty) {
   case SYBCHAR:    CAMLreturn(Val_int(0));
   case SYBVARCHAR: CAMLreturn(Val_int(1));
   case SYBINTN: CAMLreturn(Val_int(2));
@@ -387,27 +481,37 @@ CAMLexport value ocaml_freetds_dbcoltype(value vdbproc, value vc)
 CAMLexport value ocaml_freetds_dbcancel(value vdbproc)
 {
   CAMLparam1(vdbproc);
-  dbcancel(DBPROCESS_VAL(vdbproc));
+  DBPROCESS* dbproc = DBPROCESS_VAL(vdbproc);
+
+  dbcancel(dbproc);
+  maybe_raise_userdata_exn(dbproc);
+
   CAMLreturn(Val_unit);
 }
 
 CAMLexport value ocaml_freetds_dbcanquery(value vdbproc)
 {
   CAMLparam1(vdbproc);
-  dbcanquery(DBPROCESS_VAL(vdbproc));
+  DBPROCESS* dbproc = DBPROCESS_VAL(vdbproc);
+
+  dbcanquery(dbproc);
+  maybe_raise_userdata_exn(dbproc);
+
   CAMLreturn(Val_unit);
 }
-
 
 CAMLexport value ocaml_freetds_dbnextrow(value vdbproc)
 {
   /* noalloc */
+  CAMLparam1(vdbproc);
   DBPROCESS *dbproc = DBPROCESS_VAL(vdbproc);
-  STATUS st;
 
-  switch (st = dbnextrow(dbproc)) {
+  STATUS st = dbnextrow(dbproc);
+  maybe_raise_userdata_exn(dbproc);
+
+  switch (st) {
   case REG_ROW:
-    return(Val_int(st));
+    CAMLreturn(Val_int(st));
     break;
 
   case NO_MORE_ROWS:
@@ -425,15 +529,20 @@ CAMLexport value ocaml_freetds_dbnextrow(value vdbproc)
     break;
 
   default:
-    return(Val_int(st));
+    CAMLreturn(Val_int(st));
   }
 }
-
 
 CAMLexport value ocaml_freetds_dbdata(value vdbproc, value vc)
 {
   CAMLparam2(vdbproc, vc);
-  CAMLreturn((value) dbdata(DBPROCESS_VAL(vdbproc), Int_val(vc)));
+  CAMLlocal1(vdata);
+
+  DBPROCESS *dbproc = DBPROCESS_VAL(vdbproc);
+  vdata = (value)dbdata(dbproc, Int_val(vc));
+  maybe_raise_userdata_exn(dbproc);
+
+  CAMLreturn(vdata);
 }
 
 CAMLexport value ocaml_freetds_is_null(value data_ptr)
@@ -447,9 +556,13 @@ CAMLexport value ocaml_freetds_dbdatlen(value vdbproc, value vc)
 {
   /* noalloc */
   CAMLparam2(vdbproc, vc);
-  CAMLreturn(Val_int(dbdatlen(DBPROCESS_VAL(vdbproc), Int_val(vc))));
-}
+  DBPROCESS *dbproc = DBPROCESS_VAL(vdbproc);
 
+  int len = dbdatlen(dbproc, Int_val(vc));
+  maybe_raise_userdata_exn(dbproc);
+
+  CAMLreturn(Val_int(len));
+}
 
 CAMLexport value ocaml_freetds_get_data(value vdbproc, value vcol,
                                         value vdata)
@@ -462,6 +575,7 @@ CAMLexport value ocaml_freetds_get_data(value vdbproc, value vcol,
   int col = Int_val(vcol), ty, data_int;
   double data_double;
   DBDATEREC di;
+  RETCODE ret;
 
 /* Taken from the implementation of caml_copy_string */
 #define COPY_STRING(res, s, len_bytes)           \
@@ -469,17 +583,18 @@ CAMLexport value ocaml_freetds_get_data(value vdbproc, value vcol,
   memmove(String_val(res), s, len_bytes);
 
 #define CONVERT_STRING(destlen)                                         \
-  data_byte = malloc(destlen); /* printable size */                     \
+  data_byte = caml_stat_alloc(destlen); /* printable size */            \
   converted_len =                                                       \
     dbconvert(dbproc, ty, data, len, SYBCHAR, data_byte, destlen);      \
+  if (converted_len >= 0) {                                             \
+    COPY_STRING(vdata, (char *) data_byte, converted_len);              \
+  }                                                                     \
+  caml_stat_free(data_byte);                                            \
+  maybe_raise_userdata_exn(dbproc);                                     \
   if (converted_len < 0) {                                              \
-    free(data_byte);                                                    \
     raise_error(SEVERITY_RESOURCE,                                      \
                 "Freetds.Dblib.nextrow: problem with copying strings. " \
                 "Please contact the author of the Freetds bindings.");  \
-  } else {                                                              \
-    COPY_STRING(vdata, (char *) data_byte, converted_len);              \
-    free(data_byte);                                                    \
   }
 
 #define CONSTRUCTOR(tag, value)        \
@@ -487,7 +602,12 @@ CAMLexport value ocaml_freetds_get_data(value vdbproc, value vcol,
   Store_field(vconstructor, 0, value)
 
   len = dbdatlen(dbproc, col);
-  switch (ty = dbcoltype(dbproc, col)) {
+  maybe_raise_userdata_exn(dbproc);
+
+  ty = dbcoltype(dbproc, col);
+  maybe_raise_userdata_exn(dbproc);
+
+  switch (ty) {
   case SYBCHAR:    /* fall-through */
   case SYBVARCHAR:
   case SYBTEXT:
@@ -504,16 +624,18 @@ CAMLexport value ocaml_freetds_get_data(value vdbproc, value vcol,
   case SYBINT1:
     dbconvert(dbproc, ty, data, len,
               SYBINT4, (BYTE*) &data_int, sizeof(int));
+    maybe_raise_userdata_exn(dbproc);
     CONSTRUCTOR(1, Val_int(data_int));
     break;
   case SYBINT2:
     dbconvert(dbproc, ty, data, len,
               SYBINT4, (BYTE*) &data_int, sizeof(int));
+    maybe_raise_userdata_exn(dbproc);
     CONSTRUCTOR(2, Val_int(data_int));
     break;
   case SYBINTN:
   case SYBINT4:
-    data_int = *((int *) data);
+    data_int = *((int*)data);
 #if OCAML_WORD_SIZE == 32
     if (-1073741824 <= data_int && data_int < 1073741824)
       CONSTRUCTOR(3, Val_int(data_int));
@@ -534,6 +656,7 @@ CAMLexport value ocaml_freetds_get_data(value vdbproc, value vcol,
   case SYBREAL:
     dbconvert(dbproc, ty, data, len,
               SYBFLT8, (BYTE*) &data_double, sizeof(double));
+    maybe_raise_userdata_exn(dbproc);
     CONSTRUCTOR(6, caml_copy_double(data_double));
     break;
 
@@ -553,7 +676,9 @@ CAMLexport value ocaml_freetds_get_data(value vdbproc, value vcol,
   case SYBDATETIME:
   case SYBDATETIME4:
   case SYBDATETIMN:
-    if (dbdatecrack(dbproc, &di, (DBDATETIME *) data) == FAIL) {
+    ret = dbdatecrack(dbproc, &di, (DBDATETIME *) data);
+    maybe_raise_userdata_exn(dbproc);
+    if(ret == FAIL) {
       raise_error(SEVERITY_CONSISTENCY,
                   "Freetds.Dblib.nextrow: date conversion failed. "
                   "Please contact the author of these bindings.");
@@ -587,6 +712,7 @@ CAMLexport value ocaml_freetds_get_data(value vdbproc, value vcol,
   case SYBMONEYN:
     dbconvert(dbproc, ty, data, len,
               SYBFLT8, (BYTE*) &data_double, sizeof(double));
+    maybe_raise_userdata_exn(dbproc);
     CONSTRUCTOR(8, caml_copy_double(data_double));
     break;
 
@@ -609,6 +735,7 @@ CAMLexport value ocaml_freetds_dbcount(value vdbproc)
   CAMLlocal1(vcount);
   DBPROCESS *dbproc = DBPROCESS_VAL(vdbproc);
   vcount = dbcount(dbproc);
+  maybe_raise_userdata_exn(dbproc);
   CAMLreturn(Val_int(vcount));
 }
 
